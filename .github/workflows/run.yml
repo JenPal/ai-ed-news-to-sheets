@@ -2,7 +2,7 @@ name: AI Ed News to Sheets
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+    - cron: "0 14,2 * * *"  # every 30 minutes
   workflow_dispatch:
 
 concurrency:
