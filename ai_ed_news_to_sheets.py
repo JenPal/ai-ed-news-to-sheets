@@ -121,32 +121,39 @@ def contains_term(text: str, terms) -> bool:
             return True
     return False
 
-def get_first_paragraph(url: str, timeout: int = 6, max_chars: int = 600) -> str:
+UA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
+
+def fetch_lede_and_final_url(url: str, timeout: int = 6, max_chars: int = 600):
+    """Return (final_url, first_paragraph or '')"""
+    final_url = url
+    lede = ""
     try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"},
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        if r.status_code != 200 or not r.text:
-            return ""
-        text = trafilatura.extract(
-            r.text,
-            include_comments=False,
-            include_tables=False,
-        )
-        if not text:
-            return ""
-        paras = [p.strip() for p in text.split("\n") if p.strip()]
-        if not paras:
-            return ""
-        first = paras[0]
-        if len(first) > max_chars:
-            first = first[:max_chars].rstrip() + "…"
-        return first
+        r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
+        if r.url:
+            final_url = r.url  # follow Google News / feed proxies
+        html = r.text if r.status_code == 200 else ""
+
+        # Try extracting from the HTML we already downloaded
+        if html:
+            text = trafilatura.extract(html, include_comments=False, include_tables=False)
+            if not text:
+                # Fallback: let trafilatura fetch directly (handles some encodings better)
+                downloaded = trafilatura.fetch_url(final_url, timeout=timeout)
+                if downloaded:
+                    text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+        else:
+            text = ""
+
+        if text:
+            paras = [p.strip() for p in text.split("\n") if p.strip()]
+            if paras:
+                lede = paras[0]
+                if len(lede) > max_chars:
+                    lede = lede[:max_chars].rstrip() + "…"
     except Exception:
-        return ""
+        pass
+    return final_url, lede
+
 
 def is_recent(published_dt: datetime, max_age_days: int, allow_undated: bool) -> bool:
     if not published_dt:
@@ -285,7 +292,7 @@ def run():
     feeds = build_feeds(cfg)
     print(f"Pulling {len(feeds)} feeds...")
 
-    # config knobs (with defaults)
+    # Config knobs (with defaults)
     max_age_days = int(cfg.get("max_age_days", 7))
     allow_undated = bool(cfg.get("allow_undated", False))
     exclude_domains = [d.lower() for d in (cfg.get("exclude_domains") or [])]
@@ -297,6 +304,7 @@ def run():
     prefer_lede_over_rss = bool(cfg.get("prefer_lede_over_rss", True))
     article_timeout_secs = int(cfg.get("article_timeout_secs", 6))
     article_max_chars = int(cfg.get("article_max_chars", 600))
+    rewrite_link_to_final = bool(cfg.get("rewrite_link_to_final", True))
 
     new_rows = []
     for url in feeds:
@@ -309,44 +317,55 @@ def run():
         for entry in parsed.entries:
             title = normalize_text(entry.get("title"))
             link_raw = entry.get("link") or entry.get("id") or ""
-            link = canonical_link(link_raw)
             summary_rss = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
-            domain = source_domain(link)
-            src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
 
-            # 1) recency gate
+            # 1) Recency hard gate
             if not is_recent(published_dt, max_age_days, allow_undated):
                 continue
 
-            # 2) domain/text excludes
+            # 2) Resolve to final URL and try to fetch lede
+            final_url = link_raw
+            lede = ""
+            if fetch_article_text and link_raw:
+                final_url, lede = fetch_lede_and_final_url(
+                    link_raw, timeout=article_timeout_secs, max_chars=article_max_chars
+                )
+
+            # Use resolved URL for dedupe/source; optionally write it to the sheet
+            link_for_sheet = final_url if rewrite_link_to_final and final_url else link_raw
+            link_canon = canonical_link(link_for_sheet)
+            domain = source_domain(link_canon)
+            src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
+
+            # 3) Excludes
             if domain and any(d in domain for d in exclude_domains):
                 continue
             low_text = f"{title} {summary_rss}"
             if any(re.search(pat, low_text, flags=re.I) for pat in exclude_patterns):
                 continue
 
-            # 3) require clear edu term
+            # 4) Require at least one clear edu term
             if require_edu_term and not contains_term(low_text, edu_terms):
                 continue
 
-            # 4) score relevance
+            # 5) Relevance score
             s = score_relevance(title, summary_rss, domain, cfg)
             if s < min_score:
                 continue
 
-            # 5) dedupe
-            _id = hash_id(title, link)
+            # 6) Dedupe
+            _id = hash_id(title, link_canon)
             if _id in seen_ids:
                 continue
 
-            # 6) published timestamp
-            if published_dt:
-                published_utc = published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                published_utc = ""
+            # 7) Timestamp string
+            published_utc = (
+                published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                if published_dt else ""
+            )
 
-            # 7) tags
+            # 8) Tags
             low = low_text.lower()
             tags = []
             if "k-12" in low or "k12" in low:
@@ -356,24 +375,13 @@ def run():
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
 
-            # 8) pick summary (lede beats RSS if available)
-            lede = ""
-            if fetch_article_text:
-                lede = get_first_paragraph(
-                    link, timeout=article_timeout_secs, max_chars=article_max_chars
-                )
+            # 9) Choose summary (lede beats RSS if available)
             summary_out = lede if (lede and prefer_lede_over_rss) else summary_rss
 
-            # 9) append exactly once
-            new_rows.append([published_utc, src, title, link, summary_out, str(s), ",".join(tags), _id])
+            # 10) Append once
+            new_rows.append([published_utc, src, title, link_canon, summary_out, str(s), ",".join(tags), _id])
 
-    if new_rows:
-        ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
-        print(f"Appended {len(new_rows)} rows.")
-    else:
-        print("No new rows met the threshold.")
-
-        appended = 0
+    appended = 0
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
         appended = len(new_rows)
@@ -381,7 +389,7 @@ def run():
     else:
         print("No new rows met the threshold.")
 
-    # Update README tab (if enabled)
+    # Optional: update README tab if you added upsert_readme()
     if bool(cfg.get("readme_enabled", True)):
         stats = {
             "appended": appended,
@@ -389,7 +397,11 @@ def run():
             "min_score": min_score,
             "max_age_days": max_age_days,
         }
-        upsert_readme(ws.spreadsheet, cfg, stats)
+        try:
+            upsert_readme(ws.spreadsheet, cfg, stats)
+        except Exception as e:
+            print(f"README update skipped: {e}")
+
 
 
 
