@@ -59,11 +59,6 @@ Tags are inferred crudely from text (`K-12`, `HigherEd`, `Policy`). Adjust as ne
 
 ---
 
-## Colab option
-
-If you want to run ad‑hoc in Colab using OAuth instead of a service account, use the notebook version you already have. This repo is optimized for unattended scheduling with Actions.
-
----
 
 ## Troubleshooting
 
