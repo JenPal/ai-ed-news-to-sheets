@@ -160,6 +160,14 @@ def run():
     feeds = build_feeds(cfg)
     print(f"Pulling {len(feeds)} feeds...")
 
+    # pull these once
+    max_age_days = int(cfg.get("max_age_days", 7))
+    allow_undated = bool(cfg.get("allow_undated", False))
+    exclude_domains = [d.lower() for d in (cfg.get("exclude_domains") or [])]
+    exclude_patterns = cfg.get("exclude_patterns") or []
+    require_edu_term = bool(cfg.get("require_edu_term", True))
+    edu_terms = cfg.get("keywords_nice", [])
+
     new_rows = []
     for url in feeds:
         try:
@@ -174,48 +182,42 @@ def run():
             link = canonical_link(link_raw)
             summary = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
-            published_utc = published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             domain = source_domain(link)
             src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
 
-            s = score_relevance(ttitle, summary, domain, cfg, published_dt=published_dt))
+            # 1) recency gate
+            if not is_recent(published_dt, max_age_days, allow_undated):
+                continue
+
+            # 2) domain/text excludes
+            if domain and any(d in domain for d in exclude_domains):
+                continue
+            low_text = f"{title} {summary}"
+            if any(re.search(pat, low_text, flags=re.I) for pat in exclude_patterns):
+                continue
+
+            # 3) require clear edu term (separate from AI must-terms)
+            if require_edu_term and not contains_term(low_text, edu_terms):
+                continue
+
+            # 4) score relevance (no published_dt param; your function doesn't take it)
+            s = score_relevance(title, summary, domain, cfg)
             if s < min_score:
                 continue
 
+            # 5) dedupe
+            _id = hash_id(title, link)
+            if _id in seen_ids:
+                continue
+
+            # 6) published timestamp string
             if published_dt:
                 published_utc = published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             else:
                 published_utc = ""
 
-            # recentness hard gate
-            max_age_days = int(cfg.get("max_age_days", 7))
-            allow_undated = bool(cfg.get("allow_undated", False))
-            if not is_recent(published_dt, max_age_days, allow_undated):
-                continue
-
-            # domain/text excludes
-            if domain and any(d.lower() in domain for d in (cfg.get("exclude_domains") or [])):
-                continue
-            low_text = f"{title} {summary}"
-            excluded = False
-            for pat in (cfg.get("exclude_patterns") or []):
-                if re.search(pat, low_text, flags=re.I):
-                    excluded = True
-                    break
-            if excluded:
-                continue
-
-            # require at least one clear edu term (separate from AI must-terms)
-            if cfg.get("require_edu_term", True):
-                edu_terms = cfg.get("keywords_nice", [])  # reuse your existing list
-                if not contains_term(low_text, edu_terms):
-                    continue
-            
-            _id = hash_id(title, link)
-            if _id in seen_ids:
-                continue
-
-            low = f"{title} {summary}".lower()
+            # 7) simple tags
+            low = low_text.lower()
             tags = []
             if "k-12" in low or "k12" in low:
                 tags.append("K-12")
@@ -231,6 +233,7 @@ def run():
         print(f"Appended {len(new_rows)} rows.")
     else:
         print("No new rows met the threshold.")
+
 
 if __name__ == "__main__":
     for attempt in range(2):
