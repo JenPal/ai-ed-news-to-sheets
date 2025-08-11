@@ -8,6 +8,8 @@ from urllib.parse import quote, urlparse, urlunparse
 from datetime import datetime, timezone
 from dateutil import parser as dtparse
 from datetime import timedelta
+import requests
+import trafilatura
 
 
 
@@ -119,6 +121,33 @@ def contains_term(text: str, terms) -> bool:
             return True
     return False
 
+def get_first_paragraph(url: str, timeout: int = 6, max_chars: int = 600) -> str:
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if r.status_code != 200 or not r.text:
+            return ""
+        text = trafilatura.extract(
+            r.text,
+            include_comments=False,
+            include_tables=False,
+        )
+        if not text:
+            return ""
+        paras = [p.strip() for p in text.split("\n") if p.strip()]
+        if not paras:
+            return ""
+        first = paras[0]
+        if len(first) > max_chars:
+            first = first[:max_chars].rstrip() + "…"
+        return first
+    except Exception:
+        return ""
+
 def is_recent(published_dt: datetime, max_age_days: int, allow_undated: bool) -> bool:
     if not published_dt:
         return bool(allow_undated)
@@ -160,13 +189,18 @@ def run():
     feeds = build_feeds(cfg)
     print(f"Pulling {len(feeds)} feeds...")
 
-    # pull these once
+    # config knobs (with defaults)
     max_age_days = int(cfg.get("max_age_days", 7))
     allow_undated = bool(cfg.get("allow_undated", False))
     exclude_domains = [d.lower() for d in (cfg.get("exclude_domains") or [])]
     exclude_patterns = cfg.get("exclude_patterns") or []
     require_edu_term = bool(cfg.get("require_edu_term", True))
     edu_terms = cfg.get("keywords_nice", [])
+
+    fetch_article_text = bool(cfg.get("fetch_article_text", True))
+    prefer_lede_over_rss = bool(cfg.get("prefer_lede_over_rss", True))
+    article_timeout_secs = int(cfg.get("article_timeout_secs", 6))
+    article_max_chars = int(cfg.get("article_max_chars", 600))
 
     new_rows = []
     for url in feeds:
@@ -180,7 +214,7 @@ def run():
             title = normalize_text(entry.get("title"))
             link_raw = entry.get("link") or entry.get("id") or ""
             link = canonical_link(link_raw)
-            summary = normalize_text(entry.get("summary") or entry.get("description") or "")
+            summary_rss = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
             domain = source_domain(link)
             src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
@@ -192,16 +226,16 @@ def run():
             # 2) domain/text excludes
             if domain and any(d in domain for d in exclude_domains):
                 continue
-            low_text = f"{title} {summary}"
+            low_text = f"{title} {summary_rss}"
             if any(re.search(pat, low_text, flags=re.I) for pat in exclude_patterns):
                 continue
 
-            # 3) require clear edu term (separate from AI must-terms)
+            # 3) require clear edu term
             if require_edu_term and not contains_term(low_text, edu_terms):
                 continue
 
-            # 4) score relevance (no published_dt param; your function doesn't take it)
-            s = score_relevance(title, summary, domain, cfg)
+            # 4) score relevance
+            s = score_relevance(title, summary_rss, domain, cfg)
             if s < min_score:
                 continue
 
@@ -210,13 +244,13 @@ def run():
             if _id in seen_ids:
                 continue
 
-            # 6) published timestamp string
+            # 6) published timestamp
             if published_dt:
                 published_utc = published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             else:
                 published_utc = ""
 
-            # 7) simple tags
+            # 7) tags
             low = low_text.lower()
             tags = []
             if "k-12" in low or "k12" in low:
@@ -226,13 +260,23 @@ def run():
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
 
-            new_rows.append([published_utc, src, title, link, summary, str(s), ",".join(tags), _id])
+            # 8) pick summary (lede beats RSS if available)
+            lede = ""
+            if fetch_article_text:
+                lede = get_first_paragraph(
+                    link, timeout=article_timeout_secs, max_chars=article_max_chars
+                )
+            summary_out = lede if (lede and prefer_lede_over_rss) else summary_rss
+
+            # 9) append exactly once
+            new_rows.append([published_utc, src, title, link, summary_out, str(s), ",".join(tags), _id])
 
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
         print(f"Appended {len(new_rows)} rows.")
     else:
         print("No new rows met the threshold.")
+
 
 
 if __name__ == "__main__":
