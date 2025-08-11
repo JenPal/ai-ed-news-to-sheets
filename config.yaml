@@ -8,6 +8,19 @@ min_score: 3
 
 google_news_query: '"AI in education" OR "generative AI" education OR "edtech AI"'
 
+# keep only stories newer than this many days
+max_age_days: 7
+
+# skip items that don't clearly mention education
+require_edu_term: true
+
+# optional: treat RSS items with no date as old and skip them
+allow_undated: false
+
+# block specific domains or text patterns
+exclude_domains: []
+exclude_patterns: ["\\b(sponsored)\\b"] 
+
 feeds:
   - "https://news.google.com/rss/search?q=%22AI%20in%20education%22&hl=en-US&gl=US&ceid=US:en"
   - "https://news.google.com/rss/search?q=generative%20AI%20education&hl=en-US&gl=US&ceid=US:en"

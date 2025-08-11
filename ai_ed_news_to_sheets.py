@@ -7,6 +7,9 @@ import feedparser
 from urllib.parse import quote, urlparse, urlunparse
 from datetime import datetime, timezone
 from dateutil import parser as dtparse
+from datetime import timedelta
+
+
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -82,7 +85,8 @@ def parse_published(entry):
             return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
         except Exception:
             pass
-    return datetime.now(timezone.utc)
+    # don't pretend undated items are "now"
+    return None
 
 def canonical_link(url: str) -> str:
     if not url:
@@ -103,6 +107,24 @@ def hash_id(title, link):
     h.update((title or "").encode("utf-8"))
     h.update((link or "").encode("utf-8"))
     return h.hexdigest()[:16]
+
+def contains_term(text: str, terms) -> bool:
+    text_l = (text or "").lower()
+    for t in (terms or []):
+        t = (t or "").lower().strip()
+        if not t:
+            continue
+        # word-boundary match so "ai" doesn't hit "chair"
+        if re.search(rf"\b{re.escape(t)}\b", text_l):
+            return True
+    return False
+
+def is_recent(published_dt: datetime, max_age_days: int, allow_undated: bool) -> bool:
+    if not published_dt:
+        return bool(allow_undated)
+    now = datetime.now(timezone.utc)
+    age = now - published_dt.astimezone(timezone.utc)
+    return age <= timedelta(days=max_age_days)
 
 def score_relevance(title, summary, domain, cfg):
     title_l = (title or "").lower()
@@ -156,10 +178,39 @@ def run():
             domain = source_domain(link)
             src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
 
-            s = score_relevance(title, summary, domain, cfg)
+            s = score_relevance(ttitle, summary, domain, cfg, published_dt=published_dt))
             if s < min_score:
                 continue
 
+            if published_dt:
+                published_utc = published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                published_utc = ""
+
+            # recentness hard gate
+            max_age_days = int(cfg.get("max_age_days", 7))
+            allow_undated = bool(cfg.get("allow_undated", False))
+            if not is_recent(published_dt, max_age_days, allow_undated):
+                continue
+
+            # domain/text excludes
+            if domain and any(d.lower() in domain for d in (cfg.get("exclude_domains") or [])):
+                continue
+            low_text = f"{title} {summary}"
+            excluded = False
+            for pat in (cfg.get("exclude_patterns") or []):
+                if re.search(pat, low_text, flags=re.I):
+                    excluded = True
+                    break
+            if excluded:
+                continue
+
+            # require at least one clear edu term (separate from AI must-terms)
+            if cfg.get("require_edu_term", True):
+                edu_terms = cfg.get("keywords_nice", [])  # reuse your existing list
+                if not contains_term(low_text, edu_terms):
+                    continue
+            
             _id = hash_id(title, link)
             if _id in seen_ids:
                 continue
