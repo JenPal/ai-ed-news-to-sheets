@@ -179,6 +179,102 @@ def score_relevance(title, summary, domain, cfg):
         score += w_src
     return score
 
+def upsert_readme(spreadsheet, cfg, stats):
+    """
+    Create/update a README tab explaining what this sheet does.
+    stats = {"appended": int, "feeds_count": int, "min_score": int, "max_age_days": int}
+    """
+    title = str(cfg.get("readme_title", "README"))
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=200, cols=4)
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    feeds_count = stats.get("feeds_count", 0)
+    min_score = stats.get("min_score", cfg.get("min_score", 2))
+    max_age_days = stats.get("max_age_days", cfg.get("max_age_days", 7))
+    appended = stats.get("appended", 0)
+
+    # Keep it simple: two columns, wrapped text
+    lines = [
+        ["AI in Education News · README", ""],
+        ["Last run (UTC)", now_utc],
+        ["What this does",
+         ("• Pulls recent AI + Education headlines from RSS (incl. Google News search)\n"
+          "• Filters by recency (≤ {d} days) and relevance (min_score ≥ {s})\n"
+          "• De-duplicates by title + canonical URL\n"
+          "• Writes rows to the 'AI_Ed_News' tab").format(d=max_age_days, s=min_score)],
+        ["Columns",
+         "published_utc · source · title · url · summary · score · tags · id"],
+        ["Sources",
+         f"{feeds_count} feeds configured in config.yaml (see `feeds` and `google_news_query`)."],
+        ["Relevance rules",
+         ("Must include at least one of: {must}\n"
+          "Education hints: {nice}\n"
+          "Source bonus domains: {eduish}").format(
+             must=", ".join(cfg.get("keywords_must", [])) or "—",
+             nice=", ".join(cfg.get("keywords_nice", [])) or "—",
+             eduish=", ".join(cfg.get("eduish_domains", [])) or "—",
+         )],
+        ["Recency & filters",
+         ("max_age_days: {d}\n"
+          "require_edu_term: {r}\n"
+          "allow_undated: {u}\n"
+          "exclude_domains: {ed}\n"
+          "exclude_patterns: {ep}").format(
+             d=max_age_days,
+             r=bool(cfg.get("require_edu_term", True)),
+             u=bool(cfg.get("allow_undated", False)),
+             ed=", ".join(cfg.get("exclude_domains", [])) or "—",
+             ep=", ".join(cfg.get("exclude_patterns", [])) or "—",
+         )],
+        ["Lede extraction",
+         ("fetch_article_text: {fat}\n"
+          "prefer_lede_over_rss: {pl}\n"
+          "article_timeout_secs: {t}\n"
+          "article_max_chars: {m}").format(
+             fat=bool(cfg.get("fetch_article_text", True)),
+             pl=bool(cfg.get("prefer_lede_over_rss", True)),
+             t=int(cfg.get("article_timeout_secs", 6)),
+             m=int(cfg.get("article_max_chars", 600)),
+         )],
+        ["Latest run result", f"Appended {appended} new rows."],
+        ["Maintenance",
+         ("• To change sources: edit `config.yaml` → feeds / google_news_query\n"
+          "• To adjust strictness: raise `min_score` or lower it if too quiet\n"
+          "• To change recency: set `max_age_days`\n"
+          "• To pause: disable the GitHub Action in the repo’s Actions tab")],
+    ]
+
+    ws.clear()
+    ws.update("A1", lines, value_input_option="RAW")
+
+    # Pretty up: wrap text, widen columns, bold title
+    try:
+        ws.format("A1:B1", {"textFormat": {"bold": True, "fontSize": 14}})
+        ws.format("A1:B200", {"wrapStrategy": "WRAP"})
+        # widen column B
+        spreadsheet.batch_update({
+            "requests": [
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 1,
+                            "endIndex": 2
+                        },
+                        "properties": {"pixelSize": 700},
+                        "fields": "pixelSize"
+                    }
+                }
+            ]
+        })
+    except Exception:
+        # Formatting failures are non-fatal; content is what matters.
+        pass
+
 # --------------- Runner ---------------
 
 def run():
@@ -276,6 +372,24 @@ def run():
         print(f"Appended {len(new_rows)} rows.")
     else:
         print("No new rows met the threshold.")
+
+        appended = 0
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
+        appended = len(new_rows)
+        print(f"Appended {appended} rows.")
+    else:
+        print("No new rows met the threshold.")
+
+    # Update README tab (if enabled)
+    if bool(cfg.get("readme_enabled", True)):
+        stats = {
+            "appended": appended,
+            "feeds_count": len(feeds),
+            "min_score": min_score,
+            "max_age_days": max_age_days,
+        }
+        upsert_readme(ws.spreadsheet, cfg, stats)
 
 
 

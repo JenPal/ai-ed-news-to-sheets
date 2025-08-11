@@ -17,6 +17,9 @@ fetch_article_text: true
 prefer_lede_over_rss: true
 article_timeout_secs: 6
 article_max_chars: 600
+readme_enabled: true
+readme_title: "README"
+
 
 # block specific domains or text patterns
 exclude_domains: []
