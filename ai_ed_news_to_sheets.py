@@ -121,7 +121,7 @@ def contains_term(text: str, terms) -> bool:
             return True
     return False
 
-UUA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
 
 def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
     """Return (final_url, first_paragraph or '') after following redirects."""
@@ -324,7 +324,7 @@ def run():
             continue
 
         for entry in parsed.entries:
-                        title = normalize_text(entry.get("title"))
+            title = normalize_text(entry.get("title"))
             link_raw = entry.get("link") or entry.get("id") or ""
             summary_rss = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
