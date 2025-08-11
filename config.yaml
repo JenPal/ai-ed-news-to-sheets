@@ -1,0 +1,48 @@
+# For GitHub Actions, keep service_account_json as-is; the workflow writes the key at runtime.
+sheet_id: "1Tqx5OgtQtGWYRn8MX8YoW-wVL5yy5shb8eQH8bdkK1Y"
+worksheet_title: "AI_Ed_News"
+service_account_json: "service_account.json"
+
+# Relevance scoring
+min_score: 3
+
+google_news_query: '"AI in education" OR "generative AI" education OR "edtech AI"'
+
+feeds:
+  - "https://news.google.com/rss/search?q=%22AI%20in%20education%22&hl=en-US&gl=US&ceid=US:en"
+  - "https://news.google.com/rss/search?q=generative%20AI%20education&hl=en-US&gl=US&ceid=US:en"
+  - "https://www.classcentral.com/report/category/ai/feed/"
+  - "https://www.edsurge.com/recent.rss"
+  - "https://www.edsurge.com/news.rss"
+  - "https://www.insidehighered.com/rss/news"
+  - "https://thejournal.com/rss-feeds/ed-tech-news.aspx"
+
+keywords_must:
+  - "ai"
+  - "artificial intelligence"
+
+keywords_nice:
+  - "education"
+  - "school"
+  - "classroom"
+  - "student"
+  - "teacher"
+  - "university"
+  - "curriculum"
+  - "assessment"
+  - "edtech"
+  - "higher ed"
+  - "k-12"
+
+weights:
+  title_keyword: 2
+  summary_keyword: 1
+  source_bonus_edu: 1
+
+eduish_domains:
+  - "edsurge.com"
+  - "insidehighered.com"
+  - "thejournal.com"
+  - "chronicle.com"
+  - "classcentral.com"
+  - "hechingerreport.org"

@@ -1,0 +1,9 @@
+# environments and caches
+venv/
+.env
+__pycache__/
+*.pyc
+
+# local config/keys
+service_account.json
+
