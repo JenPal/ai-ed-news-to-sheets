@@ -121,28 +121,36 @@ def contains_term(text: str, terms) -> bool:
             return True
     return False
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
+UUA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
 
-def fetch_lede_and_final_url(url: str, timeout: int = 6, max_chars: int = 600):
-    """Return (final_url, first_paragraph or '')"""
-    final_url = url
-    lede = ""
+def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
+    """Return (final_url, first_paragraph or '') after following redirects."""
+    final_url, lede = url, ""
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
         if r.url:
-            final_url = r.url  # follow Google News / feed proxies
+            final_url = r.url
+
         html = r.text if r.status_code == 200 else ""
 
-        # Try extracting from the HTML we already downloaded
-        if html:
-            text = trafilatura.extract(html, include_comments=False, include_tables=False)
-            if not text:
-                # Fallback: let trafilatura fetch directly (handles some encodings better)
-                downloaded = trafilatura.fetch_url(final_url, timeout=timeout)
-                if downloaded:
-                    text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
-        else:
-            text = ""
+        # Pass 1: extract from the HTML we already fetched
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,
+        ) if html else None
+
+        # Pass 2: let trafilatura fetch directly if needed (helps with encodings/redirects)
+        if not text:
+            downloaded = trafilatura.fetch_url(final_url, timeout=timeout)
+            if downloaded:
+                text = trafilatura.extract(
+                    downloaded,
+                    include_comments=False,
+                    include_tables=False,
+                    favor_precision=True,
+                )
 
         if text:
             paras = [p.strip() for p in text.split("\n") if p.strip()]
@@ -153,6 +161,7 @@ def fetch_lede_and_final_url(url: str, timeout: int = 6, max_chars: int = 600):
     except Exception:
         pass
     return final_url, lede
+
 
 
 def is_recent(published_dt: datetime, max_age_days: int, allow_undated: bool) -> bool:
@@ -315,59 +324,56 @@ def run():
             continue
 
         for entry in parsed.entries:
-            title = normalize_text(entry.get("title"))
+                        title = normalize_text(entry.get("title"))
             link_raw = entry.get("link") or entry.get("id") or ""
             summary_rss = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
 
-            # 1) Recency hard gate
+            # 1) Recency gate
             if not is_recent(published_dt, max_age_days, allow_undated):
                 continue
 
-            # 2) Resolve to final URL and try to fetch lede
-            final_url = link_raw
-            lede = ""
+            # 2) Resolve to final URL + try lede
+            final_url, lede = (link_raw, "")
             if fetch_article_text and link_raw:
                 final_url, lede = fetch_lede_and_final_url(
                     link_raw, timeout=article_timeout_secs, max_chars=article_max_chars
                 )
 
-            # Use resolved URL for dedupe/source; optionally write it to the sheet
+            # 3) Canonicalize the URL we’ll store
             link_for_sheet = final_url if rewrite_link_to_final and final_url else link_raw
             link_canon = canonical_link(link_for_sheet)
             domain = source_domain(link_canon)
             src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
 
-            # 3) Excludes
+            # 4) Excludes and edu-term
             if domain and any(d in domain for d in exclude_domains):
                 continue
             low_text = f"{title} {summary_rss}"
             if any(re.search(pat, low_text, flags=re.I) for pat in exclude_patterns):
                 continue
-
-            # 4) Require at least one clear edu term
             if require_edu_term and not contains_term(low_text, edu_terms):
                 continue
 
-            # 5) Relevance score
+            # 5) Score with RSS text (stable)
             s = score_relevance(title, summary_rss, domain, cfg)
             if s < min_score:
                 continue
 
-            # 6) Dedupe
+            # 6) Deduplicate
             _id = hash_id(title, link_canon)
             if _id in seen_ids:
                 continue
 
-            # 7) Timestamp string
+            # 7) Timestamp
             published_utc = (
                 published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 if published_dt else ""
             )
 
-            # 8) Tags
-            low = low_text.lower()
+            # 8) Tags (+ mark summary source)
             tags = []
+            low = low_text.lower()
             if "k-12" in low or "k12" in low:
                 tags.append("K-12")
             if "higher" in low or "university" in low or "college" in low:
@@ -375,11 +381,13 @@ def run():
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
 
-            # 9) Choose summary (lede beats RSS if available)
-            summary_out = lede if (lede and prefer_lede_over_rss) else summary_rss
+            use_lede = bool(lede) and prefer_lede_over_rss
+            tags.append("src:LEDE" if use_lede else "src:RSS")
 
-            # 10) Append once
+            # 9) Choose summary and append once
+            summary_out = lede if use_lede else summary_rss
             new_rows.append([published_utc, src, title, link_canon, summary_out, str(s), ",".join(tags), _id])
+
 
     appended = 0
     if new_rows:

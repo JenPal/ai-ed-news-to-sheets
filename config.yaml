@@ -15,8 +15,8 @@ exclude_domains: []
 exclude_patterns: []
 fetch_article_text: true
 prefer_lede_over_rss: true
-article_timeout_secs: 6
-article_max_chars: 600
+article_timeout_secs: 8
+article_max_chars: 800
 readme_enabled: true
 readme_title: "README"
 rewrite_link_to_final: true  
