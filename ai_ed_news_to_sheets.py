@@ -12,6 +12,7 @@ import trafilatura
 import string
 from difflib import SequenceMatcher
 from urllib.parse import quote, urlparse, urlunparse, unquote, parse_qs
+import html as htmllib
 
 
 
@@ -209,7 +210,6 @@ def _unwrap_googleish(url: str, html: str = "") -> str:
 
     # 2) Google AMP Viewer: https://www.google.com/amp(/s)/<publisher>/<path>
     if host.endswith("google.com") and u.path.startswith("/amp"):
-        # strip /amp and optional leading s/
         path = u.path.split("/amp/", 1)[-1]
         if path.startswith("s/"):
             path = path[2:]
@@ -224,10 +224,11 @@ def _unwrap_googleish(url: str, html: str = "") -> str:
     if html:
         hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', html, flags=re.I)
         for h in hrefs:
-            if not _is_googleish_host(urlparse(h).netloc):
+            if not _is_googleish(h):
                 return h
 
     return url
+
 
 
 def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
@@ -486,7 +487,9 @@ def run():
             # 3) Resolve to final URL + try lede
             final_url, lede = (candidate_url, "")
             if fetch_article_text and candidate_url:
-                final_url, lede = fetch_lede_and_final_url(candidate_url, timeout=article_timeout_secs, max_chars=article_max_chars)
+                final_url, lede = fetch_lede_and_final_url(
+                    candidate_url, timeout=article_timeout_secs, max_chars=article_max_chars
+                )
 
             # 4) Canonicalize the URL we’ll store
             link_for_sheet = final_url if rewrite_link_to_final and final_url else candidate_url
@@ -528,13 +531,24 @@ def run():
                 tags.append("HigherEd")
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
-            tags.append("src:LEDE" if (lede and prefer_lede_over_rss) else "src:RSS")
+            use_lede = bool(lede) and prefer_lede_over_rss
+            tags.append("src:LEDE" if use_lede else "src:RSS")
+
+            # useful warning if we’re still stuck on Google News
+            if _is_googleish(link_canon):
+                print(f"[WARN] Stuck on Google News: {title[:80]} -> {link_canon}")
 
             # 10) Choose summary and append
-            summary_out = lede if (lede and prefer_lede_over_rss) else summary_rss
-            if _is_googleish(link_canon):
-            print(f"[WARN] Stuck on Google News: {title[:80]} -> {link_canon}")
+            summary_out = lede if use_lede else summary_rss
             new_rows.append([published_utc, src, title, link_canon, summary_out, str(s), ",".join(tags), _id])
+
+    appended = 0
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
+        appended = len(new_rows)
+        print(f"Appended {appended} rows.")
+    else:
+        print("No new rows met the threshold.")
 
     # Optional: update README tab if you added upsert_readme()
     if bool(cfg.get("readme_enabled", True)):
