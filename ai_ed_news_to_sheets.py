@@ -4,12 +4,15 @@ import sys
 import time
 import yaml
 import feedparser
-from urllib.parse import quote, urlparse, urlunparse
 from datetime import datetime, timezone
 from dateutil import parser as dtparse
 from datetime import timedelta
 import requests
 import trafilatura
+import string
+from difflib import SequenceMatcher
+from urllib.parse import quote, urlparse, urlunparse, unquote
+
 
 
 
@@ -123,34 +126,49 @@ def contains_term(text: str, terms) -> bool:
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
 
+def _is_googleish(u: str) -> bool:
+    try:
+        host = urlparse(u).netloc.lower()
+    except Exception:
+        return False
+    return ("news.google." in host) or host.endswith("google.com")
+
 def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
-    """Return (final_url, first_paragraph or '') after following redirects."""
+    """
+    Follow redirects, escape Google News wrapper pages, and return:
+    (final_publisher_url, first_paragraph_or_empty).
+    """
     final_url, lede = url, ""
+    html = ""
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
-        if r.url:
-            final_url = r.url
-
+        final_url = r.url or url
         html = r.text if r.status_code == 200 else ""
 
-        # Pass 1: extract from the HTML we already fetched
-        text = trafilatura.extract(
-            html,
-            include_comments=False,
-            include_tables=False,
-            favor_precision=True,
-        ) if html else None
+        # If we landed on a Google News page, try to find the actual publisher URL.
+        if _is_googleish(final_url) and html:
+            # Look for an encoded ?url=... in the HTML
+            m = re.search(r'[?&]url=(https?%3A%2F%2F[^"&]+)', html)
+            if m:
+                final_url = unquote(m.group(1))
+                html = ""  # force a clean fetch below
+            else:
+                # Otherwise, pick the first non-Google absolute link, preferring AMP
+                hrefs = re.findall(r'href="(https?://[^"]+)"', html)
+                hrefs = [h for h in hrefs if not _is_googleish(h)]
+                if hrefs:
+                    hrefs.sort(key=lambda u: (0 if ('/amp' in u or urlparse(u).netloc.startswith('amp.')) else 1, -len(u)))
+                    final_url = hrefs[0]
+                    html = ""  # fetch fresh
 
-        # Pass 2: let trafilatura fetch directly if needed (helps with encodings/redirects)
+        # Try extracting from any HTML we already have; else let trafilatura fetch.
+        text = None
+        if html and not _is_googleish(final_url):
+            text = trafilatura.extract(html, include_comments=False, include_tables=False, favor_precision=True)
         if not text:
             downloaded = trafilatura.fetch_url(final_url, timeout=timeout)
             if downloaded:
-                text = trafilatura.extract(
-                    downloaded,
-                    include_comments=False,
-                    include_tables=False,
-                    favor_precision=True,
-                )
+                text = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_precision=True)
 
         if text:
             paras = [p.strip() for p in text.split("\n") if p.strip()]
@@ -291,12 +309,61 @@ def upsert_readme(spreadsheet, cfg, stats):
         # Formatting failures are non-fatal; content is what matters.
         pass
 
+# --------------- Deduplication ---------------
+def normalize_title_for_dedupe(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    # kill punctuation, collapse spaces
+    table = str.maketrans({c: " " for c in string.punctuation})
+    s = s.translate(table)
+    s = re.sub(r"\s+", " ", s).strip()
+    # optional: trim boilerplate words at ends
+    s = re.sub(r"\b(opinion|analysis|sponsored)\b$", "", s).strip()
+    return s
+
+def get_existing_dedupe_maps(ws):
+    """
+    Read existing rows and return:
+      - seen_ids: set of 'id'
+      - seen_pairs: set of (norm_title, domain)
+      - titles_by_domain: dict[domain] -> list of norm_title
+    """
+    vals = ws.get_all_values()
+    seen_ids, seen_pairs = set(), set()
+    titles_by_domain = {}
+    if not vals or len(vals) < 2:
+        return seen_ids, seen_pairs, titles_by_domain
+
+    header = vals[0]
+    idx_id = header.index("id")
+    idx_t  = header.index("title")
+    idx_u  = header.index("url")
+
+    for row in vals[1:]:
+        if len(row) <= max(idx_id, idx_t, idx_u):
+            continue
+        _id = row[idx_id]
+        t = normalize_title_for_dedupe(row[idx_t])
+        d = source_domain(row[idx_u] or "")
+        if _id:
+            seen_ids.add(_id)
+        if t and d:
+            seen_pairs.add((t, d))
+            titles_by_domain.setdefault(d, []).append(t)
+    return seen_ids, seen_pairs, titles_by_domain
+
 # --------------- Runner ---------------
 
 def run():
     cfg = load_config()
     ws = connect_sheet(cfg)
-    seen_ids = get_seen_ids(ws)
+    seen_ids, seen_pairs, titles_by_domain = get_existing_dedupe_maps(ws)
+    # also track what we add this run so we don't double-append in the same batch
+    added_ids = set()
+    added_pairs = set()
+    added_titles_by_domain = {}
+
     min_score = int(cfg.get("min_score", 2))
     feeds = build_feeds(cfg)
     print(f"Pulling {len(feeds)} feeds...")
@@ -360,10 +427,26 @@ def run():
             if s < min_score:
                 continue
 
-            # 6) Deduplicate
+            # 6) Deduplicate: ID first, then title+domain, then fuzzy title match by domain
             _id = hash_id(title, link_canon)
-            if _id in seen_ids:
+            if _id in seen_ids or _id in added_ids:
                 continue
+
+            t_norm = normalize_title_for_dedupe(title)
+            pair = (t_norm, domain)
+
+            if domain:
+                if pair in seen_pairs or pair in added_pairs:
+                    continue
+
+                # fuzzy catch: same domain, ~same title (handles tiny edits)
+                existing_titles = titles_by_domain.get(domain, []) + added_titles_by_domain.get(domain, [])
+                fuzzy_hit = any(SequenceMatcher(None, t_norm, et).ratio() >= float(cfg.get("fuzzy_title_threshold", 0.92))
+                                for et in existing_titles)
+                if fuzzy_hit:
+                    continue
+
+
 
             # 7) Timestamp
             published_utc = (
@@ -387,7 +470,9 @@ def run():
             # 9) Choose summary and append once
             summary_out = lede if use_lede else summary_rss
             new_rows.append([published_utc, src, title, link_canon, summary_out, str(s), ",".join(tags), _id])
-
+            added_ids.add(_id)
+            added_pairs.add(pair)
+            added_titles_by_domain.setdefault(domain, []).append(t_norm)
 
     appended = 0
     if new_rows:

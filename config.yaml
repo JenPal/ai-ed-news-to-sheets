@@ -19,7 +19,8 @@ article_timeout_secs: 8
 article_max_chars: 800
 readme_enabled: true
 readme_title: "README"
-rewrite_link_to_final: true  
+rewrite_link_to_final: true 
+fuzzy_title_threshold: 0.92
 
 
 
