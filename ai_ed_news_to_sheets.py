@@ -11,7 +11,8 @@ import requests
 import trafilatura
 import string
 from difflib import SequenceMatcher
-from urllib.parse import quote, urlparse, urlunparse, unquote
+from urllib.parse import quote, urlparse, urlunparse, unquote, parse_qs
+
 
 
 
@@ -126,46 +127,124 @@ def contains_term(text: str, terms) -> bool:
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; AI-Ed-NewsBot/1.0)"}
 
+
 def _is_googleish(u: str) -> bool:
     try:
         host = urlparse(u).netloc.lower()
     except Exception:
         return False
-    return ("news.google." in host) or host.endswith("google.com")
+    return ("news.google." in host) or host.endswith("google.com") or host.endswith("googleusercontent.com")
+
+def _unwrap_url_param(u: str) -> str:
+    try:
+        q = parse_qs(urlparse(u).query)
+        if "url" in q and q["url"]:
+            return unquote(q["url"][0])
+    except Exception:
+        pass
+    return u
+
+def pick_publisher_url_from_entry(entry) -> str:
+    """
+    For Google News items, try to find the real publisher URL from description or link params.
+    Works for most GN RSS variants without extra deps.
+    """
+    candidates = []
+
+    # 1) Try description: often contains <a href="https://publisher...">
+    desc = entry.get("summary") or entry.get("description") or ""
+    if desc:
+        desc = htmllib.unescape(desc)
+        hrefs = re.findall(r'href="(https?://[^"]+)"', desc)
+        candidates.extend(hrefs)
+
+    # 2) Try link rels
+    for l in (entry.get("links") or []):
+        href = l.get("href")
+        if href:
+            candidates.append(href)
+
+    # 3) Fallback: raw link
+    if entry.get("link"):
+        candidates.append(entry["link"])
+
+    # Clean, unwrap, and filter
+    cleaned = []
+    for u in candidates:
+        u = _unwrap_url_param(u)
+        u = unquote(u)
+        if u and not _is_googleish(u):
+            cleaned.append(u)
+
+    # Prefer AMP or obvious article-looking URLs
+    if cleaned:
+        cleaned.sort(key=lambda u: (0 if ("/amp" in u or urlparse(u).netloc.startswith("amp.")) else 1, -len(u)))
+        return cleaned[0]
+
+    # Nothing non-Google found; return raw link so the next step can still try
+    return entry.get("link") or ""
+
+
+def _canonical_from_html(html: str) -> str | None:
+    if not html:
+        return None
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https?://[^"\']+)["\']', html, re.I)
+    return m.group(1) if m else None
+
+def _unwrap_googleish(url: str, html: str = "") -> str:
+    """Turn Google News/AMP/redirect URLs into the real publisher URL if possible."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return url
+    host = u.netloc.lower()
+
+    # 1) Redirect params: ?url= / ?q= / ?u= / ?dest=
+    qs = parse_qs(u.query or "")
+    for key in ("url", "q", "u", "dest"):
+        if key in qs:
+            cand = unquote(qs[key][0])
+            if cand.startswith("http"):
+                return cand
+
+    # 2) Google AMP Viewer: https://www.google.com/amp(/s)/<publisher>/<path>
+    if host.endswith("google.com") and u.path.startswith("/amp"):
+        # strip /amp and optional leading s/
+        path = u.path.split("/amp/", 1)[-1]
+        if path.startswith("s/"):
+            path = path[2:]
+        return f"https://{path}"
+
+    # 3) HTML canonical tag
+    canon = _canonical_from_html(html)
+    if canon:
+        return canon
+
+    # 4) First non-Google absolute link in the page (prefer AMP links)
+    if html:
+        hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', html, flags=re.I)
+        for h in hrefs:
+            if not _is_googleish_host(urlparse(h).netloc):
+                return h
+
+    return url
+
 
 def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
     """
-    Follow redirects, escape Google News wrapper pages, and return:
-    (final_publisher_url, first_paragraph_or_empty).
+    Follow redirects; if we still land on a Google page, we won't extract text.
+    Returns (final_url, first_paragraph_or_empty).
     """
     final_url, lede = url, ""
-    html = ""
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
         final_url = r.url or url
         html = r.text if r.status_code == 200 else ""
 
-        # If we landed on a Google News page, try to find the actual publisher URL.
-        if _is_googleish(final_url) and html:
-            # Look for an encoded ?url=... in the HTML
-            m = re.search(r'[?&]url=(https?%3A%2F%2F[^"&]+)', html)
-            if m:
-                final_url = unquote(m.group(1))
-                html = ""  # force a clean fetch below
-            else:
-                # Otherwise, pick the first non-Google absolute link, preferring AMP
-                hrefs = re.findall(r'href="(https?://[^"]+)"', html)
-                hrefs = [h for h in hrefs if not _is_googleish(h)]
-                if hrefs:
-                    hrefs.sort(key=lambda u: (0 if ('/amp' in u or urlparse(u).netloc.startswith('amp.')) else 1, -len(u)))
-                    final_url = hrefs[0]
-                    html = ""  # fetch fresh
-
-        # Try extracting from any HTML we already have; else let trafilatura fetch.
         text = None
         if html and not _is_googleish(final_url):
             text = trafilatura.extract(html, include_comments=False, include_tables=False, favor_precision=True)
-        if not text:
+        if not text and not _is_googleish(final_url):
             downloaded = trafilatura.fetch_url(final_url, timeout=timeout)
             if downloaded:
                 text = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_precision=True)
@@ -179,6 +258,8 @@ def fetch_lede_and_final_url(url: str, timeout: int = 8, max_chars: int = 600):
     except Exception:
         pass
     return final_url, lede
+
+
 
 
 
@@ -392,7 +473,6 @@ def run():
 
         for entry in parsed.entries:
             title = normalize_text(entry.get("title"))
-            link_raw = entry.get("link") or entry.get("id") or ""
             summary_rss = normalize_text(entry.get("summary") or entry.get("description") or "")
             published_dt = parse_published(entry)
 
@@ -400,20 +480,21 @@ def run():
             if not is_recent(published_dt, max_age_days, allow_undated):
                 continue
 
-            # 2) Resolve to final URL + try lede
-            final_url, lede = (link_raw, "")
-            if fetch_article_text and link_raw:
-                final_url, lede = fetch_lede_and_final_url(
-                    link_raw, timeout=article_timeout_secs, max_chars=article_max_chars
-                )
+            # 2) Find best candidate URL (escape Google News)
+            candidate_url = pick_publisher_url_from_entry(entry)
 
-            # 3) Canonicalize the URL we’ll store
-            link_for_sheet = final_url if rewrite_link_to_final and final_url else link_raw
+            # 3) Resolve to final URL + try lede
+            final_url, lede = (candidate_url, "")
+            if fetch_article_text and candidate_url:
+                final_url, lede = fetch_lede_and_final_url(candidate_url, timeout=article_timeout_secs, max_chars=article_max_chars)
+
+            # 4) Canonicalize the URL we’ll store
+            link_for_sheet = final_url if rewrite_link_to_final and final_url else candidate_url
             link_canon = canonical_link(link_for_sheet)
             domain = source_domain(link_canon)
             src = domain or normalize_text(parsed.feed.get("title", "")) or "unknown"
 
-            # 4) Excludes and edu-term
+            # 5) Excludes and edu-term
             if domain and any(d in domain for d in exclude_domains):
                 continue
             low_text = f"{title} {summary_rss}"
@@ -422,39 +503,23 @@ def run():
             if require_edu_term and not contains_term(low_text, edu_terms):
                 continue
 
-            # 5) Score with RSS text (stable)
+            # 6) Score with RSS text (stable)
             s = score_relevance(title, summary_rss, domain, cfg)
             if s < min_score:
                 continue
 
-            # 6) Deduplicate: ID first, then title+domain, then fuzzy title match by domain
+            # 7) Dedup
             _id = hash_id(title, link_canon)
-            if _id in seen_ids or _id in added_ids:
+            if _id in seen_ids:
                 continue
 
-            t_norm = normalize_title_for_dedupe(title)
-            pair = (t_norm, domain)
-
-            if domain:
-                if pair in seen_pairs or pair in added_pairs:
-                    continue
-
-                # fuzzy catch: same domain, ~same title (handles tiny edits)
-                existing_titles = titles_by_domain.get(domain, []) + added_titles_by_domain.get(domain, [])
-                fuzzy_hit = any(SequenceMatcher(None, t_norm, et).ratio() >= float(cfg.get("fuzzy_title_threshold", 0.92))
-                                for et in existing_titles)
-                if fuzzy_hit:
-                    continue
-
-
-
-            # 7) Timestamp
+            # 8) Timestamp
             published_utc = (
                 published_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 if published_dt else ""
             )
 
-            # 8) Tags (+ mark summary source)
+            # 9) Tags (+ mark summary source)
             tags = []
             low = low_text.lower()
             if "k-12" in low or "k12" in low:
@@ -463,24 +528,13 @@ def run():
                 tags.append("HigherEd")
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
+            tags.append("src:LEDE" if (lede and prefer_lede_over_rss) else "src:RSS")
 
-            use_lede = bool(lede) and prefer_lede_over_rss
-            tags.append("src:LEDE" if use_lede else "src:RSS")
-
-            # 9) Choose summary and append once
-            summary_out = lede if use_lede else summary_rss
+            # 10) Choose summary and append
+            summary_out = lede if (lede and prefer_lede_over_rss) else summary_rss
+            if _is_googleish(link_canon):
+            print(f"[WARN] Stuck on Google News: {title[:80]} -> {link_canon}")
             new_rows.append([published_utc, src, title, link_canon, summary_out, str(s), ",".join(tags), _id])
-            added_ids.add(_id)
-            added_pairs.add(pair)
-            added_titles_by_domain.setdefault(domain, []).append(t_norm)
-
-    appended = 0
-    if new_rows:
-        ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
-        appended = len(new_rows)
-        print(f"Appended {appended} rows.")
-    else:
-        print("No new rows met the threshold.")
 
     # Optional: update README tab if you added upsert_readme()
     if bool(cfg.get("readme_enabled", True)):

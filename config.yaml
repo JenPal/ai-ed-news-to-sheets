@@ -31,11 +31,13 @@ exclude_patterns: ["\\b(sponsored)\\b"]
 feeds:
   - "https://news.google.com/rss/search?q=%22AI%20in%20education%22&hl=en-US&gl=US&ceid=US:en"
   - "https://news.google.com/rss/search?q=generative%20AI%20education&hl=en-US&gl=US&ceid=US:en"
-  - "https://www.classcentral.com/report/category/ai/feed/"
-  - "https://www.edsurge.com/recent.rss"
+  - "https://news.google.com/rss/search?q=site:edsurge.com%20(AI%20OR%20%22artificial%20intelligence%22)&hl=en-US&gl=US&ceid=US:en"
   - "https://www.edsurge.com/news.rss"
-  - "https://www.insidehighered.com/rss/news"
-  - "https://thejournal.com/rss-feeds/ed-tech-news.aspx"
+  - "https://thejournal.com/rss-feeds/all-articles.aspx"
+  - "https://hechingerreport.org/feed/"
+  - "https://rss.nytimes.com/services/xml/rss/nyt/Education.xml"
+  - "https://www.oecdguidelines.nl/rss"
+  
 
 keywords_must:
   - "ai"
