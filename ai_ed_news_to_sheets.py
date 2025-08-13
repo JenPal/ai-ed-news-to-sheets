@@ -511,7 +511,7 @@ def run():
             if s < min_score:
                 continue
 
-            # 7) Dedup
+            # 7) Deduplicate
             _id = hash_id(title, link_canon)
             if _id in seen_ids:
                 continue
@@ -531,10 +531,11 @@ def run():
                 tags.append("HigherEd")
             if "policy" in low or "regulation" in low:
                 tags.append("Policy")
+
             use_lede = bool(lede) and prefer_lede_over_rss
             tags.append("src:LEDE" if use_lede else "src:RSS")
 
-            # useful warning if we’re still stuck on Google News
+            # useful warning if we're still stuck on Google News
             if _is_googleish(link_canon):
                 print(f"[WARN] Stuck on Google News: {title[:80]} -> {link_canon}")
 
